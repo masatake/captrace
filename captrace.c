@@ -19,16 +19,11 @@
 #define max(x,y) ((x) >= (y) ? (x) : (y))
 #define CAPABILITY_COUNT ((CAP_LAST_CAP) + 1)
 
-// Only defined in kernels >= v3.3-RC1
-#define CAP_OPT_NOAUDIT 2
-// Only defined in kernels < 3.3-RC1
-#define SECURITY_CAP_AUDIT 1
-
 typedef uint64_t cap_num_t;
 
-static const char *KPROBE_DEF = "p:captrace cap_capable arg3=%%dx arg4=%%r10 arg5=%%r8\n";
-static const char *KPROBE_UNDEF = "-:captrace\n";
-static const char *KPROBE_FORMAT = " %" xstr(MAX_PROGNAME_PID_SIZE) "s %*s %*s %Lf : captrace : %*s arg3=%" SCNx64 " arg4=%" SCNx64 " arg5=%" SCNx64 " ";
+// Extracted from events/capability/cap_capable/fmt
+static const char *EVENT_FORMAT = " %" xstr(MAX_PROGNAME_PID_SIZE) "s %*s %*s %Lf: cap_capable: cred %*p, target_ns %*p, capable_ns %*p, cap %d, ret %d";
+
 static volatile int interrupted = 0;
 // To keep updated, e.g.:
 // cat /usr/include/linux/capability.h | sed -rn 's/^#define (CAP_\S+)\s+([0-9]+)$/[\1] = "\1",/p'
@@ -83,8 +78,6 @@ static void print_help(FILE *out, int exit_status)
     fprintf(out, "Options:\n");
     fprintf(out, "  -h            print this help message to stdout and exit\n");
     fprintf(out, "  -s            only show a summary, when exiting\n");
-    fprintf(out, "  -v            include non-audited capability checks\n");
-    fprintf(out, "                (by default only audited checks are shown)\n");
     fprintf(out, "  -f            follow forks, also trace capabilities in children\n");
     fprintf(out, "  -p <pid>      only trace the given process id\n");
     fprintf(out, "  -t <path>     path to tracefs (default: /sys/kernel/tracing)\n");
@@ -227,14 +220,6 @@ static int setup_tracing(int tracefs_fd, uint64_t target_pid, int follow_forks)
 {
     int res = 0;
 
-    res = write_tracing(tracefs_fd, "kprobe_events", KPROBE_DEF);
-    if (res != 0 && res != EBUSY) // ignore error in case of leftover probe from previous session
-    {
-        fprintf(stderr, "Error: unable to create kprobe, code %d (%s)\n", res, strerror(res));
-        print_last_tracing_error(tracefs_fd);
-        goto cleanup;
-    }
-
     if (follow_forks > 0)
     {
         res = write_tracing(tracefs_fd, "trace_options", "event-fork\n");
@@ -250,7 +235,7 @@ static int setup_tracing(int tracefs_fd, uint64_t target_pid, int follow_forks)
         res = write_tracing(tracefs_fd, "set_event_pid", "%u\n", target_pid);
         if (res != 0)
         {
-            fprintf(stderr, "Error: unable to set kprobe pid target, code %d (%s)\n", res, strerror(res));
+            fprintf(stderr, "Error: unable to set event pid target, code %d (%s)\n", res, strerror(res));
             print_last_tracing_error(tracefs_fd);
             goto cleanup;
         }
@@ -260,16 +245,16 @@ static int setup_tracing(int tracefs_fd, uint64_t target_pid, int follow_forks)
         res = write_tracing(tracefs_fd, "set_event_pid", "\n");
         if (res != 0)
         {
-            fprintf(stderr, "Error: unable to remove kprobe target pids, code %d (%s)\n", res, strerror(res));
+            fprintf(stderr, "Error: unable to remove event target pids, code %d (%s)\n", res, strerror(res));
             print_last_tracing_error(tracefs_fd);
             goto cleanup;
         }
     }
 
-    res = write_tracing(tracefs_fd, "events/kprobes/captrace/enable", "1\n");
+    res = write_tracing(tracefs_fd, "events/capability/cap_capable/enable", "1\n");
     if (res != 0)
     {
-        fprintf(stderr, "Error: unable to enable kprobe, code %d (%s)\n", res, strerror(res));
+        fprintf(stderr, "Error: unable to enable cap_capable, code %d (%s)\n", res, strerror(res));
         print_last_tracing_error(tracefs_fd);
         goto cleanup;
     }
@@ -292,7 +277,7 @@ cleanup:
  * If summarize=1, only statistics are printed, at the end.
  * Returns 0 on success, an error code otherwise.
  */
-static int process_tracing(int tracefs_fd, int audited_only, int summarize, FILE *out)
+static int process_tracing(int tracefs_fd, int summarize, FILE *out)
 {
     int res = 0;
     int pipe_fd = -1;
@@ -302,11 +287,9 @@ static int process_tracing(int tracefs_fd, int audited_only, int summarize, FILE
     char *cap_prog_path = safe_alloc(PATH_MAX + 1);
     uint64_t cap_pid = 0;
     long double cap_time = 0.0;
-    uint64_t arg3 = 0;
-    uint64_t arg4 = 0;
-    uint64_t arg5 = 0;
+    int cap = 0;
+    int ret = 0;
     cap_num_t cap_num;
-    bool cap_audit;
     const char *cap_str = NULL;
     uint64_t *counters = safe_alloc(CAPABILITY_COUNT * sizeof(uint64_t));
     size_t max_cap_len = 0;
@@ -343,23 +326,16 @@ static int process_tracing(int tracefs_fd, int audited_only, int summarize, FILE
         goto cleanup;
     }
 
-    while ((res = fscanf(pipe_file, KPROBE_FORMAT,
-        cap_prog, &cap_time, &arg3, &arg4, &arg5)) != EOF)
+    while ((res = fscanf(pipe_file, EVENT_FORMAT,
+                         cap_prog, &cap_time, &cap, &ret)) != EOF)
     {
         if (interrupted)
             break;
-        if (res != 5)
+        if (res != 4)
             continue;
-        if (arg3 >= 0xFFFF800000000000) // Kernel < v3.3-RC1
-        {
-            cap_num = arg4;
-            cap_audit = (arg5 & SECURITY_CAP_AUDIT) != 0;
-        }
-        else // Kernel >= v3.3-RC1
-        {
-            cap_num = arg3;
-            cap_audit = (arg4 & CAP_OPT_NOAUDIT) == 0;
-        }
+
+        cap_num = cap;
+
         cap_pid = 0;
         // Parse PID from <prog name>-<pid> (prog name may include dashes...)
         for (int i = strlen(cap_prog); i >= 0; i--)
@@ -371,8 +347,6 @@ static int process_tracing(int tracefs_fd, int audited_only, int summarize, FILE
                 break;
             }
         }
-        if (cap_audit == 0 && audited_only)
-            continue;
         if (cap_pid == 0)
         {
             fprintf(stderr, "Error: cannot parse PID from '%s'\n", cap_prog);
@@ -399,11 +373,11 @@ static int process_tracing(int tracefs_fd, int audited_only, int summarize, FILE
             strncpy(cap_prog_path, cap_prog, PATH_MAX + 1);
         cap_str = resolve_capability_name(cap_num);
         if (cap_str == NULL)
-            fprintf(out, "%Lf\t%" PRIu64 "\t%s\t%-*" PRIu64 "\n",
-                cap_time, cap_pid, cap_prog_path, (int)max_cap_len, cap_num);
+            fprintf(out, "%Lf\t%" PRIu64 "\t%s\t%-*" PRIu64 "\t%3d\n",
+                    cap_time, cap_pid, cap_prog_path, (int)max_cap_len, cap_num, ret);
         else
-            fprintf(out, "%Lf\t%" PRIu64 "\t%s\t%-*s\n",
-                cap_time, cap_pid, cap_prog_path, (int)max_cap_len, cap_str);
+            fprintf(out, "%Lf\t%" PRIu64 "\t%s\t%-*s\t%3d\n",
+                    cap_time, cap_pid, cap_prog_path, (int)max_cap_len, cap_str, ret);
     }
     if (!interrupted && res != 4)
         fprintf(stderr, "Error while reading trace event: code %u error %u\n", res, errno);
@@ -432,7 +406,7 @@ cleanup:
 }
 
 /**
- * Called at the end of a tracing session, to remove our kprobe
+ * Called at the end of a tracing session, to disable the cap_capable event
  * (and its overhead) and to reset tracing settings to their defaults.
  * Returns 0 on success, an error code otherwise.
  */
@@ -440,12 +414,9 @@ static int cleanup_tracing(int tracefs_fd)
 {
     int res = 0;
 
-    res = write_tracing(tracefs_fd, "events/kprobes/captrace/enable", "0\n");
+    res = write_tracing(tracefs_fd, "events/capability/cap_capable/enable", "0\n");
     if (res != 0)
-        fprintf(stderr, "Error: unable to disable kprobe, code %d (%s)\n", res, strerror(res));
-    res = write_tracing(tracefs_fd, "kprobe_events", KPROBE_UNDEF);
-    if (res != 0 && res != ENOENT)
-        fprintf(stderr, "Error: unable to undefine kprobe, code %d (%s)\n", res, strerror(res));
+        fprintf(stderr, "Error: unable to disable cap_capable, code %d (%s)\n", res, strerror(res));
     res = write_tracing(tracefs_fd, "trace_options", "noevent-fork\n");
     if (res != 0)
         fprintf(stderr, "Error: unable to unset trace option event-fork, code %d (%s)\n", res, strerror(res));
@@ -468,7 +439,6 @@ int main(int argc, char* argv[])
     int res = 0;
     int follow_forks = 0;
     int summarize = 0;
-    int audited_only = 1;
     uint64_t target_pid = 0;
     const char *tracefs_path = NULL;
     int tracefs_fd = -1;
@@ -476,13 +446,13 @@ int main(int argc, char* argv[])
     int syncpipe_fd[2] = { 0 };
     FILE *output_file = stdout;
 
-    while ((res = getopt(argc, argv, "+hsfvt:o:p:")) != -1)
+    while ((res = getopt(argc, argv, "+hsft:o:p:")) != -1)
     {
         switch (res)
         {
-	case 'h':
-	    print_help(stdout, 0);
-	    break;
+        case 'h':
+            print_help(stdout, 0);
+            break;
         case 's':
             summarize = 1;
             break;
@@ -507,9 +477,6 @@ int main(int argc, char* argv[])
                 fprintf(stderr, "Error: could not open '%s': %s\n", optarg, strerror(errno));
                 print_usage();
             }
-            break;
-        case 'v':
-            audited_only = 0;
             break;
         default:
             print_usage();
@@ -591,7 +558,7 @@ int main(int argc, char* argv[])
         close(syncpipe_fd[1]);
     }
 
-    res = process_tracing(tracefs_fd, audited_only, summarize, output_file);
+    res = process_tracing(tracefs_fd, summarize, output_file);
 
 cleanup:
     cleanup_tracing(tracefs_fd);
